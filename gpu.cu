@@ -96,7 +96,7 @@ void gpuSetDataOnGPU(void)
 void gpuGetResultOnCPU(void)
 {
   // Get GPU_C symbol
-  cudaMemcpyFromSymbol(&C[0],GPU_C,sizeof(float)*SIZE*SIZE,0,cudaMemcpyDeviceToHost); 
+  cudaMemcpyFromSymbol(&C[0],GPU_C,sizeof(T_real)*SIZE*SIZE,0,cudaMemcpyDeviceToHost); 
 }
 
 
@@ -162,10 +162,10 @@ void gpuProduct(gkid_t kid)
  case GK0 : // Kernel v0 - 1D kernel using only resgisters and cache with generic matrix size
    // - init the grid of blocs
    Db.x = BLOCK_SIZE_X_K0;
-   Db.y = 1;
+   Db.y = BLOCK_SIZE_Y_K0;
    Db.z = 1;
    Dg.x = SIZE/BLOCK_SIZE_X_K0 + ( SIZE % BLOCK_SIZE_X_K0 ? 1 : 0 );
-   Dg.y = SIZE/BLOCK_SIZE_X_K0 + ( SIZE % BLOCK_SIZE_X_K0 ? 1 : 0 );
+   Dg.y = SIZE/BLOCK_SIZE_Y_K0 + ( SIZE % BLOCK_SIZE_Y_K0 ? 1 : 0 );
    Dg.z = 1;
    // - run the Grid of Blocs of threads
    MatrixProductKernel_v0<<<Dg,Db>>>();
