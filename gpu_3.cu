@@ -3,115 +3,253 @@
 /* S. Vialle - November 2021                                                     */
 /*********************************************************************************/
 
-#ifndef __MATPROD_MAIN__
-#define __MATPROD_MAIN__
+#include <stdio.h>
+#include <stdlib.h>
+#include <cuda.h> 
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+#include "main.h"
+#include "gpu.h"
 
 
 /*-------------------------------------------------------------------------------*/
-/* CONSTANTS.                                                                    */
+/* GPU symbols and global vars                                                   */
 /*-------------------------------------------------------------------------------*/
+// Symbols used by all kernels
+__device__ T_real GPU_A[SIZE][SIZE];
+__device__ T_real GPU_B[SIZE][SIZE];
+__device__ T_real GPU_C[SIZE][SIZE];
 
-// Matrix size (side of the 3 matrixes)
-//#define SIZE              1024        // To debug
-//#define SIZE              1025        // To debug
-#define SIZE              4096        // To benchmark
-//#define SIZE              4097        // To debug
+// New Symbol and vars to call Cublas lib.
+__device__ T_real GPU_Ctmp[SIZE][SIZE];   // New matrix buffer
 
+T_real *AdrGPU_A = NULL;                  // Adresses of the symbols
+T_real *AdrGPU_B = NULL;
+T_real *AdrGPU_C = NULL;
+T_real *AdrGPU_Ctmp = NULL; 
 
-// Constants for run configurations
-#define DEFAULT_NB_THREADS  1          // Constant for OpenMP configuration
-#define DEFAULT_ONGPUFLAG   1          // Constant for computation mode configuration
-#define DEFAULT_CPUKID      CK0        // Constant for CPU Kernel config
-#define DEFAULT_GPUKID      GK0       // Constant for GPU Kernel config
-
-// Block sizes
-#define BLOCK_SIZE_X_K0     32
-#define BLOCK_SIZE_Y_K0     1
-#define BLOCK_SIZE_X_K1     32
-#define BLOCK_SIZE_Y_K1     32
-#define BLOCK_SIZE_XY_K2    32
-#define BLOCK_SIZE_XY_K3    32
-
-#define BLOCK_SIZE_XY_KT0   32
-#define BLOCK_SIZE_XY_KT1   32
+cublasHandle_t cublasHandle;              // Handle on the Cublas lib.
 
 
 /*-------------------------------------------------------------------------------*/
-/* Floating point datatype and op                                                */
+/* Init and finalize the GPU device.                                             */
 /*-------------------------------------------------------------------------------*/
-#ifdef DP
-typedef double T_real;
-#define CBLAS_GEMM cblas_dgemm
-#define CBLAS_GEAM cblas_dgeam
-#define CUBLAS_GEMM cublasDgemm
-#define CUBLAS_GEAM cublasDgeam
-#define T_REAL_TEXT "doubles"
-#define T_CUBLAS_real CUDA_R_64F
-#else
-typedef float T_real;
-#define CBLAS_GEMM cblas_sgemm
-#define CBLAS_GEAM cblas_sgeam
-#define CUBLAS_GEMM cublasSgemm
-#define CUBLAS_GEAM cublasSgeam
-#define T_REAL_TEXT "floats"
-#define T_CUBLAS_real CUDA_R_32F
-#endif
+void gpuInit(void)
+{
+  cuInit(0);
+  
+  // Extract address of GPU matrix "symbols"
+  CHECK_CUDA_SUCCESS(cudaGetSymbolAddress((void **)&AdrGPU_A,GPU_A),"GPU_A adr extraction");
+  CHECK_CUDA_SUCCESS(cudaGetSymbolAddress((void **)&AdrGPU_B,GPU_B),"GPU_B adr extraction");
+  CHECK_CUDA_SUCCESS(cudaGetSymbolAddress((void **)&AdrGPU_C,GPU_C),"GPU_C adr extraction");
+  CHECK_CUDA_SUCCESS(cudaGetSymbolAddress((void **)&AdrGPU_Ctmp,GPU_Ctmp),"GPU_Ctmp adr extraction");
+  
+  // Turn CPU arrays A, B and C into "pinned" memory areas
+  CHECK_CUDA_SUCCESS(cudaHostRegister(A,SIZE*SIZE*sizeof(T_real),
+                                      cudaHostRegisterPortable),
+                     "Turning into pinned memory the A CPU array");
+  CHECK_CUDA_SUCCESS(cudaHostRegister(B,SIZE*SIZE*sizeof(T_real),
+                                      cudaHostRegisterPortable),
+                     "Turning into pinned memory the B CPU array");
+  CHECK_CUDA_SUCCESS(cudaHostRegister(C,SIZE*SIZE*sizeof(T_real),
+                                      cudaHostRegisterPortable),
+                     "Turning into pinned memory the C CPU array");
+  
+  // Initialize CUBLAS lib usage
+  CHECK_CUBLAS_SUCCESS(cublasCreate(&cublasHandle), "Init of the CUBLAS lib handle"); 
+}
 
 
-/*-------------------------------------------------------------------------------*/
-/* Enumerated type of the different kernels                                      */
-/*-------------------------------------------------------------------------------*/
-typedef enum _ckid_t {
-   CK0 = 0,
-   CK1,
-   NB_OF_CPU_KERNELS
-} ckid_t;
+void gpuFinalize(void)
+{
+  // Turn "pinned" CPU arrays into std array
+  CHECK_CUDA_SUCCESS(cudaHostUnregister(A),
+                     "Turning into std memory the A CPU array");
+  CHECK_CUDA_SUCCESS(cudaHostUnregister(B),
+                     "Turning into std memory the B CPU array");
+  CHECK_CUDA_SUCCESS(cudaHostUnregister(C),
+                     "Turning into std memory the C CPU array");
 
-
-typedef enum _gkid_t {
-   GK0 = 0,
-   GK1,
-   GK2,
-   GK3,
-   GK4,
-   GK5,
-   GK6,
-   GK7,
-   GK8,
-   NB_OF_GPU_KERNELS
-} gkid_t;
+  // Free CUBLAS lib usage
+  CHECK_CUBLAS_SUCCESS(cublasDestroy(cublasHandle), "Free the CUBLAS lib");
+}
 
 
 /*-------------------------------------------------------------------------------*/
-/* Global variable declarations.                                                 */
+/* Transfer of CPU input data into GPU symbols                                   */
 /*-------------------------------------------------------------------------------*/
+void gpuSetDataOnGPU(void)
+{
+  // Set GPU_A symbol
+  CHECK_CUDA_SUCCESS(cudaMemcpyToSymbol(GPU_A, A, sizeof(T_real) *SIZE*SIZE, 0, cudaMemcpyHostToDevice),
+                     "[ERROR] Transfer A-->GPU_A");
+  // Set GPU_B symbol
+  CHECK_CUDA_SUCCESS(cudaMemcpyToSymbol(GPU_B, B, sizeof(T_real) *SIZE*SIZE, 0, cudaMemcpyHostToDevice),
+                     "[ERROR] Transfer B-->GPU_B");
+}
 
-/* Matrixes: C = A.B                                                             */
-/* We use the Transposed B matrix, in place of B, to improve cache memory usage. */
-extern T_real A[SIZE][SIZE];               /* Matrixes : C = A.B           */
-extern T_real B[SIZE][SIZE];               /* B Matrix.                    */
-extern T_real TB[SIZE][SIZE];
-extern T_real C[SIZE][SIZE];
-
-/* Global variables to control OpenMP computations.                              */
-extern int NbThreads;
-
-/* Global vars to control computation on the GPU.                                */
-extern int OnGPUFlag;
-extern ckid_t CPUKernelId;
-extern gkid_t GPUKernelId;
-
-/* Result checking flag.                                                         */
-extern int check_results;
 
 /*-------------------------------------------------------------------------------*/
-/* Global functions.                                                             */
+/* Transfer of GPU results into CPU array                                        */
 /*-------------------------------------------------------------------------------*/
-void Computation(double *dk, double *dt, double *dkt);
-void cpuProduct(ckid_t kid);
-int main(int argc, char *argv[]);
+void gpuGetResultOnCPU(void)
+{
+  // Get GPU_C symbol
+  cudaMemcpyFromSymbol(C,GPU_C,sizeof(T_real)*SIZE*SIZE,0,cudaMemcpyDeviceToHost); 
+}
 
 
-#endif
+/*-------------------------------------------------------------------------------*/
+/* Transposition kernel using global memory and registers.                       */
+/*-------------------------------------------------------------------------------*/
+__global__ void TransposeKernel_v0(T_real *MT, T_real *M, int mLig, int nCol)
+{
+ int lig = threadIdx.y + blockIdx.y*BLOCK_SIZE_XY_KT0;
+ int col = threadIdx.x + blockIdx.x*BLOCK_SIZE_XY_KT0;
+ 
+ if (lig < mLig && col < nCol)
+   MT[col*mLig + lig] = M[lig*nCol + col];
+}
 
-// END
+
+/*-------------------------------------------------------------------------------*/
+/* Small matrix product on the local GPU - 1D & generic matrix size              */
+/*-------------------------------------------------------------------------------*/
+__global__ void MatrixProductKernel_v0(void)
+{
+  // Index computations
+  int col = threadIdx.y + blockIdx.y*BLOCK_SIZE_Y_K0;
+  int lig = threadIdx.x + blockIdx.x*BLOCK_SIZE_X_K0;
+  T_real res = 0.0;
+
+  // Matrix product computation
+  if (col < SIZE ) {
+    for (int i=0; i<SIZE; i++) {
+      res += GPU_A[lig][i] * GPU_B[i][col];
+    }
+    GPU_C[lig][col] = res;
+  }
+
+}
+
+/*-------------------------------------------------------------------------------*/
+/* Small matrix product on the local GPU - 2D & generic matrix size              */
+/*-------------------------------------------------------------------------------*/
+__global__ void MatrixProductKernel_v1(void)
+{
+ // Index computations
+ int lig = threadIdx.y + blockIdx.y*BLOCK_SIZE_Y_K1;
+ int col = threadIdx.x + blockIdx.x*BLOCK_SIZE_X_K1;
+ T_real res = 0.0;
+
+ // Matrix product computation
+ if (col < SIZE && lig < SIZE){
+   for (int i = 0; i < SIZE; i++){
+     res += GPU_A[lig][i] * GPU_B[i][col];
+    }
+    GPU_C[lig][col] = res;
+  }
+}
+
+/*-------------------------------------------------------------------------------*/
+/* Small matrix product on the local GPU - 2D SHARED MEMORY& generic matrix size */
+/*-------------------------------------------------------------------------------*/
+
+__global__ void MatrixProductKernel_v2(void)
+{
+  __shared__ T_real sh_gpu_a[BLOCK_SIZE_XY_K2][BLOCK_SIZE_XY_K2];
+  __shared__ T_real sh_gpu_b[BLOCK_SIZE_XY_K2][BLOCK_SIZE_XY_K2];
+
+  T_real res = 0;
+
+  int lig = threadIdx.y + blockIdx.y*BLOCK_SIZE_XY_K2;
+  int col = threadIdx.x + blockIdx.x*BLOCK_SIZE_XY_K2;
+
+  for (int step = 0; step < SIZE / BLOCK_SIZE_XY_K2; step++) {
+    int lig_inter = threadIdx.y +  step * BLOCK_SIZE_XY_K2;
+    int col_inter = threadIdx.x +  step * BLOCK_SIZE_XY_K2;
+    sh_gpu_a[threadIdx.y][threadIdx.x] = GPU_A[lig][col_inter];
+    sh_gpu_b[threadIdx.y][threadIdx.x] = GPU_B[lig_inter][col];
+
+    __syncthreads();
+      for (int i = 0; i < BLOCK_SIZE_XY_K2; i++) {
+        res += sh_gpu_a[threadIdx.y][i] * sh_gpu_b[i][threadIdx.x];
+      }
+    GPU_C[lig][col] = res;
+    __syncthreads();
+  }
+}
+/*-------------------------------------------------------------------------------*/
+/* Small matrix product on the local GPU.                                        */
+/*-------------------------------------------------------------------------------*/
+void gpuProduct(gkid_t kid)
+{
+ dim3 Dg = {0,0,0};   // Grid descriptor
+ dim3 Db = {0,0,0};   // Block descriptor
+ 
+ //T_real alpha;        // When using CUBLAS
+ //T_real beta;         // When using CUBLAS
+
+ switch(kid) {
+
+ case GK0 : // Kernel v0 - 1D kernel using only resgisters and cache with generic matrix size
+   // - init the grid of blocs
+   Db.x = BLOCK_SIZE_X_K0;
+   Db.y = BLOCK_SIZE_Y_K0;
+   Db.z = 1;
+   Dg.x = SIZE/BLOCK_SIZE_X_K0 + ( SIZE % BLOCK_SIZE_X_K0 ? 1 : 0 );
+   Dg.y = SIZE/BLOCK_SIZE_Y_K0 + ( SIZE % BLOCK_SIZE_Y_K0 ? 1 : 0 );
+   Dg.z = 1;
+   // - run the Grid of Blocs of threads
+   MatrixProductKernel_v0<<<Dg,Db>>>();
+   break;
+
+  case GK1 : // kernel v1 : 2D kernel using only registers and cache with generic matrix size
+   Db.x = BLOCK_SIZE_X_K1;
+   Db.y = BLOCK_SIZE_Y_K1;
+   Db.z = 1;
+   Dg.x = (SIZE-1)/BLOCK_SIZE_X_K1 + 1;
+   Dg.y = (SIZE-1)/BLOCK_SIZE_Y_K1 + 1;
+   Dg.z = 1;
+   // - run the Grid of Blocs of threads
+   MatrixProductKernel_v1<<<Dg,Db>>>();
+   break;
+
+ case GK2 : // kernel v2 : 2D kernel using the shared memories
+   Db.x = BLOCK_SIZE_XY_K2;
+   Db.y = BLOCK_SIZE_XY_K2;
+   Db.z = 1;
+   Dg.x = (SIZE-1)/BLOCK_SIZE_XY_K2 + 1;
+   Dg.y = (SIZE-1)/BLOCK_SIZE_XY_K2 + 1;
+   Dg.z = 1;
+   MatrixProductKernel_v2<<<Dg,Db>>>();
+   break;
+  
+ case GK3 : // kernel v3 : 2D kernel using the shared memories with generic matrix size
+   break;
+
+ case GK4 : // calling cublas gemm & user-defined transpose kernel
+   break;
+   
+ case GK5 : // Calling cublas gemm & cublas geam kernels
+   break;
+
+ case GK6 : // Calling cublas gemm, using matrix math properties
+   break;
+
+ case GK7 : // Calling cublas gemmEx, using Tensor cores
+   break;
+
+ case GK8 : // Free
+   break;
+
+ default :
+   fprintf(stderr,"Unknown GPU kernel!");
+   exit(EXIT_FAILURE);
+ } // End of switch
+}
+
+
+
+
