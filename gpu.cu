@@ -82,10 +82,10 @@ void gpuFinalize(void)
 void gpuSetDataOnGPU(void)
 {
   // Set GPU_A symbol
-  CHECK_CUDA_SUCCESS(cudaMemcpyToSymbol(GPU_A, &A[0][0], sizeof(T_real) *SIZE*SIZE, 0, cudaMemcpyHostToDevice),
+  CHECK_CUDA_SUCCESS(cudaMemcpyToSymbol(GPU_A, A, sizeof(T_real) *SIZE*SIZE, 0, cudaMemcpyHostToDevice),
                      "[ERROR] Transfer A-->GPU_A");
   // Set GPU_B symbol
-  CHECK_CUDA_SUCCESS(cudaMemcpyToSymbol(GPU_B, &B[0][0], sizeof(T_real) *SIZE*SIZE, 0, cudaMemcpyHostToDevice),
+  CHECK_CUDA_SUCCESS(cudaMemcpyToSymbol(GPU_B, B, sizeof(T_real) *SIZE*SIZE, 0, cudaMemcpyHostToDevice),
                      "[ERROR] Transfer B-->GPU_B");
 }
 
@@ -96,7 +96,7 @@ void gpuSetDataOnGPU(void)
 void gpuGetResultOnCPU(void)
 {
   // Get GPU_C symbol
-  cudaMemcpyFromSymbol(&C[0],GPU_C,sizeof(T_real)*SIZE*SIZE,0,cudaMemcpyDeviceToHost); 
+  cudaMemcpyFromSymbol(C,GPU_C,sizeof(T_real)*SIZE*SIZE,0,cudaMemcpyDeviceToHost); 
 }
 
 
@@ -119,18 +119,19 @@ __global__ void TransposeKernel_v0(T_real *MT, T_real *M, int mLig, int nCol)
 __global__ void MatrixProductKernel_v0(void)
 {
   // Index computations
-  int lig = threadIdx.y + blockIdx.y*BLOCK_SIZE_Y_K0;
-  int col = threadIdx.x + blockIdx.x*BLOCK_SIZE_X_K0;
+  int col = threadIdx.y + blockIdx.y*BLOCK_SIZE_Y_K0;
+  int lig = threadIdx.x + blockIdx.x*BLOCK_SIZE_X_K0;
   T_real res = 0.0;
 
   // Matrix product computation
-  for (int i=0; i<SIZE; i++) {
-    res += GPU_A[lig][i] * GPU_B[i][col];
+  if (col < SIZE ) {
+    for (int i=0; i<SIZE; i++) {
+      res += GPU_A[lig][i] * GPU_B[i][col];
+    }
+    GPU_C[lig][col] = res;
   }
-  GPU_C[lig][col] = res;
 
 }
-
 
 /*-------------------------------------------------------------------------------*/
 /* Small matrix product on the local GPU - 2D & generic matrix size              */
@@ -138,14 +139,84 @@ __global__ void MatrixProductKernel_v0(void)
 __global__ void MatrixProductKernel_v1(void)
 {
  // Index computations
- //int lig = ...
- //int col = ..
+ int lig = threadIdx.y + blockIdx.y*BLOCK_SIZE_Y_K1;
+ int col = threadIdx.x + blockIdx.x*BLOCK_SIZE_X_K1;
+ T_real res = 0.0;
 
  // Matrix product computation
- //...
+ if (col < SIZE && lig < SIZE){
+   for (int i = 0; i < SIZE; i++){
+     res += GPU_A[lig][i] * GPU_B[i][col];
+    }
+    GPU_C[lig][col] = res;
+  }
 }
 
+/*-------------------------------------------------------------------------------*/
+/* Small matrix product on the local GPU - 2D SHARED MEMORY & fixed matrix size */
+/*-------------------------------------------------------------------------------*/
 
+__global__ void MatrixProductKernel_v2(void)
+{
+  __shared__ T_real sh_gpu_a[BLOCK_SIZE_XY_K2][BLOCK_SIZE_XY_K2];
+  __shared__ T_real sh_gpu_b[BLOCK_SIZE_XY_K2][BLOCK_SIZE_XY_K2];
+
+  T_real res = 0;
+
+  int lig = threadIdx.y + blockIdx.y*BLOCK_SIZE_XY_K2;
+  int col = threadIdx.x + blockIdx.x*BLOCK_SIZE_XY_K2;
+
+  for (int step = 0; step < SIZE / BLOCK_SIZE_XY_K2; step++) {
+    int lig_inter = threadIdx.y +  step * BLOCK_SIZE_XY_K2;
+    int col_inter = threadIdx.x +  step * BLOCK_SIZE_XY_K2;
+    sh_gpu_a[threadIdx.y][threadIdx.x] = GPU_A[lig][col_inter];
+    sh_gpu_b[threadIdx.y][threadIdx.x] = GPU_B[lig_inter][col];
+
+    __syncthreads();
+      for (int i = 0; i < BLOCK_SIZE_XY_K2; i++) {
+        res += sh_gpu_a[threadIdx.y][i] * sh_gpu_b[i][threadIdx.x];
+      }
+    __syncthreads();
+  }
+    GPU_C[lig][col] = res;
+}
+/*-------------------------------------------------------------------------------*/
+/* Small matrix product on the local GPU - 2D SHARED MEMORY & generic matrix size */
+/*-------------------------------------------------------------------------------*/
+
+__global__ void MatrixProductKernel_v3(void)
+{
+  __shared__ T_real sh_gpu_a[BLOCK_SIZE_XY_K3][BLOCK_SIZE_XY_K3];
+  __shared__ T_real sh_gpu_b[BLOCK_SIZE_XY_K3][BLOCK_SIZE_XY_K3];
+
+  T_real res = 0;
+
+  int lig = threadIdx.y + blockIdx.y*BLOCK_SIZE_XY_K3;
+  int col = threadIdx.x + blockIdx.x*BLOCK_SIZE_XY_K3;
+
+  float step_max = (SIZE/BLOCK_SIZE_XY_K3);
+
+  for (int step = 0; step < step_max; step++) {
+    int lig_inter = threadIdx.y +  step * BLOCK_SIZE_XY_K3;
+    int col_inter = threadIdx.x +  step * BLOCK_SIZE_XY_K3;
+    if (step>(int)step_max) {
+      sh_gpu_a[threadIdx.y][threadIdx.x] = 0;
+      sh_gpu_b[threadIdx.y][threadIdx.x] = 0;
+    }
+    else {
+      sh_gpu_a[threadIdx.y][threadIdx.x] = GPU_A[lig][col_inter];
+      sh_gpu_b[threadIdx.y][threadIdx.x] = GPU_B[lig_inter][col];
+    }
+
+
+    __syncthreads();
+      for (int i = 0; i < BLOCK_SIZE_XY_K3; i++) {
+        res += sh_gpu_a[threadIdx.y][i] * sh_gpu_b[i][threadIdx.x];
+      }
+    GPU_C[lig][col] = res;
+    __syncthreads();
+  }
+}
 /*-------------------------------------------------------------------------------*/
 /* Small matrix product on the local GPU.                                        */
 /*-------------------------------------------------------------------------------*/
@@ -171,13 +242,35 @@ void gpuProduct(gkid_t kid)
    MatrixProductKernel_v0<<<Dg,Db>>>();
    break;
 
- case GK1 : // kernel v1 : 2D kernel using only registers and cache with generic matrix size
+  case GK1 : // kernel v1 : 2D kernel using only registers and cache with generic matrix size
+   Db.x = BLOCK_SIZE_X_K1;
+   Db.y = BLOCK_SIZE_Y_K1;
+   Db.z = 1;
+   Dg.x = (SIZE-1)/BLOCK_SIZE_X_K1 + 1;
+   Dg.y = (SIZE-1)/BLOCK_SIZE_Y_K1 + 1;
+   Dg.z = 1;
+   // - run the Grid of Blocs of threads
+   MatrixProductKernel_v1<<<Dg,Db>>>();
    break;
 
  case GK2 : // kernel v2 : 2D kernel using the shared memories
+   Db.x = BLOCK_SIZE_XY_K2;
+   Db.y = BLOCK_SIZE_XY_K2;
+   Db.z = 1;
+   Dg.x = (SIZE-1)/BLOCK_SIZE_XY_K2 + 1;
+   Dg.y = (SIZE-1)/BLOCK_SIZE_XY_K2 + 1;
+   Dg.z = 1;
+   MatrixProductKernel_v2<<<Dg,Db>>>();
    break;
   
  case GK3 : // kernel v3 : 2D kernel using the shared memories with generic matrix size
+   Db.x = BLOCK_SIZE_XY_K3;
+   Db.y = BLOCK_SIZE_XY_K3;
+   Db.z = 1;
+   Dg.x = (SIZE-1)/BLOCK_SIZE_XY_K3 + 1;
+   Dg.y = (SIZE-1)/BLOCK_SIZE_XY_K3 + 1;
+   Dg.z = 1;
+   MatrixProductKernel_v3<<<Dg,Db>>>();
    break;
 
  case GK4 : // calling cublas gemm & user-defined transpose kernel
